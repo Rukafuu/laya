@@ -8,8 +8,10 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 import math
+import random
 from typing import Any
 
+from . import laya_eval as harness
 
 
 @dataclass
@@ -103,5 +105,14 @@ def canonicalize(probabilities, canonical_indices):
     for p, index in zip(values, canonical_indices):
         restored[index] = p
     return restored
+
+
+def permute_options(case: MetamorphicCase, seed: int = harness.SEED):
+    """One deterministic nonidentity shuffle; identity falls back to rotation."""
+    order = list(range(len(case.option_keys)))
+    random.Random(seed).shuffle(order)
+    if order == list(range(len(order))):
+        order = order[1:] + order[:1]
+    return _transform(case, "option_order", order, case.option_keys)
 
 
