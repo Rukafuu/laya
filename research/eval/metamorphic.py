@@ -137,3 +137,44 @@ def make_variants(case, rng: random.Random):
         neutralize_labels(canonical))]
 
 
+def distribution_metrics(baseline, variant):
+    """Drift in canonical space; JS uses natural logs (range 0..ln(2)).
+
+    Ties choose the first canonical option, so reordering tied slots does not
+    itself count as disagreement. Confidence is the maximum probability;
+    confidence drift is signed (variant minus baseline).
+    """
+    p = canonicalize(baseline, range(len(baseline)))
+    q = canonicalize(variant, range(len(baseline)))
+    middle = [(a + b) / 2 for a, b in zip(p, q)]
+    js = sum(0.5 * x * math.log(x / m)
+             for distribution in (p, q)
+             for x, m in zip(distribution, middle) if x > 0)
+    drift = [abs(a - b) for a, b in zip(p, q)]
+    return {
+        "semantic_agreement": max(range(len(p)), key=p.__getitem__) ==
+                              max(range(len(q)), key=q.__getitem__),
+        "mean_probability_drift": sum(drift) / len(drift),
+        "max_probability_drift": max(drift),
+        "js_divergence": max(0.0, js),
+        "confidence_drift": max(q) - max(p),
+    }
+
+
+def summarise_pairs(pairs):
+    """Pair-weighted summary; absent observations are not perfect agreement."""
+    if not pairs:
+        return {"n": 0}
+    return {
+        "n": len(pairs),
+        "semantic_agreement_rate": sum(p["semantic_agreement"] for p in pairs) / len(pairs),
+        "mean_probability_drift": sum(p["mean_probability_drift"] for p in pairs) / len(pairs),
+        "max_probability_drift": max(p["max_probability_drift"] for p in pairs),
+        "mean_js_divergence": sum(p["js_divergence"] for p in pairs) / len(pairs),
+        "mean_confidence_drift": sum(p["confidence_drift"] for p in pairs) / len(pairs),
+        "mean_absolute_confidence_drift": sum(abs(p["confidence_drift"]) for p in pairs) / len(pairs),
+        "worst_confidence_increase_on_disagreement": max(
+            [0.0] + [p["confidence_drift"] for p in pairs if not p["semantic_agreement"]]),
+    }
+
+
