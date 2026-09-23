@@ -170,3 +170,113 @@ shares with `bench_local.py` and `laya.common.ece_score`.
 * `confidence == 0.0` is not binned, matching `laya.common.ece_score` and
   `bench_local.py`. If [#39](https://github.com/NandhaKishorM/laya/pull/39) lands
   with a different boundary, this should follow it.
+
+## Metamorphic robustness (experimental)
+
+`metamorphic.py` adds the initial scope of
+[#244](https://github.com/NandhaKishorM/laya/issues/244): **choice option order** and
+**neutral labels**, without changing model/runtime behavior. Run from the repository
+root after installing Laya and `datasets`:
+
+```bash
+python -m research.eval.metamorphic --model convaiinnovations/laya \
+    --langs en --per-lang 100 --n-opts 20 --batch-size 16 --out robustness.json
+python -m research.eval.metamorphic --model convaiinnovations/laya \
+    --subfolder multilingual --langs en --out multilingual-robustness.json
+python -m unittest research.eval.test_metamorphic -v
+```
+
+Each MASSIVE case uses the existing harness's sampler and produces three inputs:
+
+1. The unchanged baseline.
+2. One seeded shuffle of option order; if the shuffle is the identity, a one-slot
+   rotation is used. This is a bounded diagnostic, not exhaustive permutation testing
+   or a uniform draw over all nonidentity permutations.
+3. Keys replaced by `A`, `B`, ... (`AA` after `Z`), retaining descriptions and order.
+
+The transformations run separately, not combined. Descriptions, instructions and
+state are otherwise unchanged. Every result is mapped back to the original semantic
+option order **before** predictions and metrics are computed. Exact ties choose the
+first canonical option. The RNG starts fresh per language; `--seed` controls both
+sampling and transformations. `--batch-size` bounds the number of forward-pass
+inputs and does not alter the generated variants. Model inference may still have
+small floating-point differences across devices and batch sizes.
+
+The JSON contains `config`, per-language `report`, and full `cases`. Each case saves
+its original input, canonical keys and optional gold index; each variant saves its
+presented keys, explicit `canonical_to_transformed` and `transformed_to_canonical` label mappings, slot-to-canonical indices, complete **canonical-order** probability
+vector, prediction, confidence, correctness (or `null`), and comparison to baseline.
+Probabilities are not rounded. The config records model/subfolder, temperature mode
+and values, truncation settings, dataset, seed and batch size. For reproducible
+checkpoint comparisons, use a pinned local snapshot and retain the environment
+versions alongside the report. `--unclamped` has the same meaning as in `laya_eval`.
+If any language fails, its error is saved and the command exits nonzero while
+retaining successful languages.
+
+Metrics are grouped under `option_order`, `neutral_label`, and `overall`:
+
+| Metric | Definition |
+|---|---|
+| `semantic_agreement_rate` | Fraction of baseline/variant pairs with the same canonical argmax |
+| `mean_probability_drift` | Mean absolute probability change across options, then pairs |
+| `max_probability_drift` | Largest absolute change of any option across all pairs |
+| `mean_js_divergence` | Mean Jensen-Shannon divergence using natural logs, in `[0, ln(2)]` |
+| `mean_confidence_drift` | Mean signed change of maximum probability, variant minus baseline |
+| `mean_absolute_confidence_drift` | Mean magnitude of that confidence change |
+| `worst_confidence_increase_on_disagreement` | Largest positive confidence change among changed decisions, or zero if none |
+
+`overall` is pair-weighted (two comparisons per case), not a fraction of cases
+where *all* variants agree. `quality` separately reports accuracy and the existing
+harness's 15-bin ECE for baseline and each transformation on labelled cases only.
+Empty groups contain `n: 0`; unlabelled quality groups contain `n_labelled: 0` without
+inventing an accuracy or ECE. Robustness agreement is not a correctness measure:
+consistently wrong predictions can be perfectly invariant.
+
+For another corpus, the Python API accepts `(state, questions)` cases in the same
+shape as the harness, and a callback returning probability vectors in presented
+option order:
+
+```python
+from research.eval.metamorphic import evaluate, model_scorer
+agent.model.eval()
+result = evaluate(cases, model_scorer(agent), gold_indices=None, seed=13)
+```
+
+The first version intentionally accepts only **one choice question per case**, with
+at least two options and nonempty descriptions. The caller must ensure descriptions
+are self-contained and neither state nor instructions refers to option keys or
+positions. Renaming a key that carries unique meaning is not a semantic invariant;
+missing/blank descriptions are rejected. Nonempty descriptions alone cannot prove
+semantic equivalence. Labels already named `A/B/...` may yield an unchanged neutral
+variant. Keep in mind that shorter labels also affect token allocation/truncation,
+so neutral-label drift measures sensitivity to the rendered input, not a causal
+isolation of lexical bias. Paraphrases, structured-state permutations, `score` and
+`noul` perturbations are deferred as proposed in the issue.
+
+For an explicit single-case experiment, the same implementation exposes:
+
+```python
+from research.eval.metamorphic import (
+    MetamorphicCase, permute_options, neutralize_labels,
+    evaluate_variants, compare_predictions,
+)
+
+case = MetamorphicCase(state, questions, gold_index=None)
+variants = [permute_options(case, seed=42), neutralize_labels(case)]
+agent.model.eval()
+results = evaluate_variants(agent, case, variants)
+report = compare_predictions(baseline=results.baseline, variants=results.variants)
+```
+
+For offline tests, pass `agent=None, score=fake_scorer` to `evaluate_variants`.
+The scorer takes a batch of harness `(state, questions)` inputs and returns one
+probability vector per input. The public transformations return independent copies
+and explicit mappings in both directions, including identity label mappings for
+order-only transformations.
+
+**Semantic agreement and distribution stability are different properties.**
+A shift from `[0.91, 0.06, 0.03]` to `[0.88, 0.08, 0.04]` preserves the decision
+while showing nonzero drift. Switching the winner is reported as disagreement,
+regardless of whether confidence rises or falls. No metric here automatically
+classifies either observation as a bug; acceptable variation depends on the use
+case, and the report deliberately defines no universal pass/fail threshold.
