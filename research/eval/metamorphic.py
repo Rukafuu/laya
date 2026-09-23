@@ -116,3 +116,24 @@ def permute_options(case: MetamorphicCase, seed: int = harness.SEED):
     return _transform(case, "option_order", order, case.option_keys)
 
 
+def neutralize_labels(case: MetamorphicCase):
+    """Replace only keys by A, B, ... AA, AB, ...; retain descriptions/order."""
+    def label(index):
+        out = ""
+        index += 1
+        while index:
+            index, digit = divmod(index - 1, 26)
+            out = chr(65 + digit) + out
+        return out
+    order = list(range(len(case.option_keys)))
+    return _transform(case, "neutral_label", order, [label(i) for i in order])
+
+
+def make_variants(case, rng: random.Random):
+    """Adapt the harness tuple format to baseline plus the two transforms."""
+    canonical = MetamorphicCase(*case)
+    return [v.as_record() for v in (
+        _baseline(canonical), permute_options(canonical, rng.getrandbits(64)),
+        neutralize_labels(canonical))]
+
+
