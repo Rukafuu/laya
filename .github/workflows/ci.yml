@@ -71,6 +71,9 @@ jobs:
           python tests/test_shortlist_cosine.py
           python tests/test_temperature_loading.py
 
+      - name: Metamorphic evaluation tests (offline)
+        run: python -m unittest research.eval.test_metamorphic -v
+
       - name: Email cleaning tests
         run: python tests/test_email.py
 
