@@ -7,7 +7,12 @@ cleaning was a no-op: Gmail's `Em ... escreveu:`, Outlook's `-----Mensagem origi
 history (often a *different* request) weighed on the answer as much as the new message did.
 """
 import re
+import unicodedata
 from typing import Dict, List, Optional
+
+# One definition, in the module that holds the other presets. Re-exported here because
+# `from laya.email import email_questions` is a path callers already have.
+from .presets import email_questions  # noqa: F401
 
 _QUOTE_HEADERS = [
     re.compile(r"^\s*On .{0,300}wrote:\s*$", re.I),
@@ -17,7 +22,12 @@ _QUOTE_HEADERS = [
     re.compile(r"^\s*-{2,}\s*(Original|Forwarded) Message\s*-{2,}", re.I),
     re.compile(r"^\s*-{2,}\s*(Mensagem (original|encaminhada)|Mensaje (original|reenviado))\s*-{2,}", re.I),
     re.compile(r"^\s*_{8,}\s*$"),
-    re.compile(r"^\s*From:\s.+$", re.I),
+    # `From:` opens ordinary prose too ("From: my side the integration works, but please
+    # refund..."), and a reply header always carries the sender, so the header is only
+    # recognised when an address follows -- the same rule as `De:` below. A bare
+    # `From: Name` header is caught by _HEADER_FROM_NAME/_HEADER_NEXT instead, which need the
+    # header's own `Sent:`/`Date:` line to tell it apart from a sentence.
+    re.compile(r"^\s*From:\s.*[@<]", re.I),
     # `De:` also opens ordinary Portuguese/Spanish lines ("De: 10/09 a 15/09"), so the Outlook
     # header is only recognised when it carries an address
     re.compile(r"^\s*De:\s.*[@<]", re.I),
@@ -29,11 +39,56 @@ _ATTRIBUTION_HEAD = re.compile(r"^\s*(On|Em|El) (?=.*\d)", re.I)
 # Exchange often leaves the address out of Outlook's reply header ("De: Maria Souza"), so a bare `De:`
 # only cuts when the header's own `Enviado:` line, or a dated `Data:`/`Fecha:` line, follows it.
 # `Para:` is not enough: "De: 10/09 / Para: 15/09" is how a leave request reads.
-_HEADER_FROM_NAME = re.compile(r"^\s*De:\s+\S", re.I)
-_HEADER_NEXT = re.compile(r"^\s*(Enviad[oa]( em| el)?:\s|(Data|Fecha):\s.*\d{4})", re.I)
+#
+# The same is true of a bare English `From: Maria Souza`, which is why the marker above needs
+# this rule: the English client lines are the translations of the two `De:` neighbours. A line
+# that only looks like prose still has to be told apart from a header by its neighbours, so the
+# English pair is "From: <name>" followed by "Sent:"/"Date:".
+_HEADER_FROM_NAME = re.compile(r"^\s*(De|From):\s+\S", re.I)
+_HEADER_NEXT = re.compile(r"^\s*(Enviad[oa]( em| el)?:\s|Sent:\s|(Data|Fecha|Date):\s.*\d{4})", re.I)
+# A closing's name starts with a letter that is not lowercase: capitalised in any script
+# (`Łukasz`, `Дмитрий`) or caseless (`山田`). `re` cannot say "not a lowercase letter in any
+# script" -- a class has to list ranges, and `[^\W\d_a-zß-öø-ÿ]` stops at Latin-1, so
+# `Thanks, żaneta` read as a name and the line counted as a sign-off. The tail is matched
+# structurally instead, and each token's first letter is judged by category below -- the same
+# rule as the TS port's `\p{Lu}\p{Lt}\p{Lo}`. Combining marks ride along with the letter before
+# them (`Jose\u0301` is `José`), as `\p{M}` allows in the port.
+_SIGNOFF_HEAD = re.compile(
+    r"^\s*(?i:best|kind|warmest|warm|many thanks|thanks|thank you|regards|cheers|sincerely)"
+    r"(?i:\s+(?:and|&)\s+regards|\s+(?:regards|wishes|again|in advance|a lot|so much|very much))?"
+)
+_SIGNOFF_TAIL = re.compile(r"^[\s,;:!.]*(?:[^\W\d_][\w\u0300-\u036f'-]*[\s,.]*){0,3}$")
+_SIGNOFF_TOKEN = re.compile(r"[^\W\d_][\w\u0300-\u036f'-]*")
+
+
+def _is_english_signoff(line: str) -> bool:
+    """True when a closing word is followed by nothing but punctuation and a short name."""
+    m = _SIGNOFF_HEAD.match(line)
+    if m is None:
+        return False
+    tail = line[m.end():]
+    if _SIGNOFF_TAIL.match(tail) is None:
+        return False
+    return all(unicodedata.category(token[0]) in ("Lu", "Lt", "Lo")
+               for token in _SIGNOFF_TOKEN.findall(tail))
+
+
+def _marker_matches(marker, line: str) -> bool:
+    """One `_SIGNATURE_MARKERS` entry: a compiled pattern, or a callable for a rule a pattern
+    cannot express (the English sign-off)."""
+    return bool(marker(line)) if callable(marker) else bool(marker.match(line))
+
+
 _SIGNATURE_MARKERS = [
     re.compile(r"^\s*--\s*$"),
-    re.compile(r"^\s*(best|kind|warm|many thanks|thanks|thank you|regards|cheers|sincerely)[\w ,!.]*$", re.I),
+    # A closing line is the closing word plus punctuation and at most a name. Anything else on
+    # the line is a sentence, and the case of the next word is what separates the two: a name is
+    # capitalised, "for" in "Thanks for the quick reply." is not. The closing words are matched
+    # case-insensitively, the name is not, so the flag is scoped instead of global.
+    # `warmest` and `and/& regards` are closings the alternation did not reach; the name that may
+    # follow is judged in `_is_english_signoff` above, a callable because `re` cannot express its
+    # rule. `Regards, Łukasz` is a sign-off, `Thanks for the reply` is not.
+    _is_english_signoff,
     re.compile(r"^\s*sent from my (iphone|android|mobile|ipad)", re.I),
     # Portuguese/Spanish sign-offs match only on their own: "Obrigado pelo retorno, mas ..." is a
     # request, not a signature, so unlike the English marker no trailing words are allowed
@@ -56,7 +111,14 @@ _DEVICE_FOOTER = re.compile(
     re.I,
 )
 _DISCLAIMER = re.compile(
-    r"(confidential|intended (solely )?for the (use of the )?(named )?(addressee|recipient)|"
+    # English: tied to a disclaimer noun and a disclaimer tail, the way the Portuguese
+    # branches below are. The bare word matched any sentence that merely mentioned it,
+    # so "Is this confidential?" and "Confidential: I need a refund." were deleted whole.
+    # `[^.]` rather than `[^.\n]`: a footer wraps, so "are\nconfidential" must still match.
+    r"(\b(e-?mail|message|information|communication|transmission|contents?)\b[^.]{0,60}"
+    r"\bconfidential\b[^.]{0,60}\b(intended|solely|addressee|recipient|privileged|"
+    r"disclos|unauthori[sz]ed)|"
+    r"\bconfidential\b[^.]{0,60}\b(and (may|is) (also )?privileged)|"
     r"if you (have )?received this (e-?mail|message) in error|"
     # Portuguese/Spanish: tied to "this message/e-mail" rather than the bare word `confidencial`,
     # which a sender's own request ("preciso do contrato confidencial") uses just as often
@@ -127,8 +189,18 @@ def _strip_disclaimer(paragraph: str) -> str:
 
 
 def clean_email_body(body: str, max_chars: int = 3000) -> str:
-    """Remove quoted email history, signatures and disclaimers to keep input focused."""
+    """Remove quoted email history, signatures and disclaimers to keep input focused.
+
+    `max_chars` is the length the result is cut to, 3000 characters unless raised -- see
+    `email_state`, which takes the same budget and passes it through.
+    """
     text = (body or "").replace("\r\n", "\n").replace("\r", "\n").replace("\\n", "\n")
+    # Bound regex work before the expensive patterns below: _DISCLAIMER uses
+    # [^.]{0,60/80/100} alternations whose cost grows with input length, and only
+    # max_chars are ever returned. Truncate lines too so one MB-long line cannot
+    # dominate matching.
+    if len(text) > max_chars * 4:
+        text = text[:max_chars * 4]
     lines = []
     src = text.split("\n")
     for i, line in enumerate(src):
@@ -147,7 +219,7 @@ def clean_email_body(body: str, max_chars: int = 3000) -> str:
     cut = len(lines)
     for i in range(max(1, min(int(len(lines) * 0.6), len(lines) - 8)), len(lines)):
         n = len(lines[i].strip())
-        if (n <= 40 and any(p.match(lines[i]) for p in _SIGNATURE_MARKERS)) or (
+        if (n <= 40 and any(_marker_matches(p, lines[i]) for p in _SIGNATURE_MARKERS)) or (
                 n <= 60 and _DEVICE_FOOTER.match(lines[i])):
             cut = i
             break
@@ -157,50 +229,24 @@ def clean_email_body(body: str, max_chars: int = 3000) -> str:
     return text[:max_chars]
 
 
-def email_state(subject: str, body: str, sender: Optional[str] = None, clean: bool = True, **extra) -> Dict:
-    """Construct a clean state dictionary for email classification."""
+def email_state(subject: str, body: str, sender: Optional[str] = None, clean: bool = True,
+                max_chars: int = 3000, **extra) -> Dict:
+    """Construct a clean state dictionary for email classification.
+
+    `max_chars` is the budget `clean_email_body` cuts the body to, and it is worth raising for a
+    long message: at the default the body stops after 3000 characters, so a request that arrives in
+    the last paragraphs never reaches the model -- including through `predict_long`, which scans a
+    state in windows precisely so it can read past one window's worth. Ignored when `clean=False`,
+    which passes the body through whole.
+
+    Any other keyword becomes a field of the state, so it is read by the model; a typo here is an
+    input mutation, not an error.
+    """
     state = {
         "subject": (subject or "").strip(),
-        "body": clean_email_body(body) if clean else (body or ""),
+        "body": clean_email_body(body, max_chars=max_chars) if clean else (body or ""),
     }
     if sender:
         state["from"] = sender
     state.update({k: v for k, v in extra.items() if v is not None})
     return state
-
-
-def email_questions(categories: Optional[Dict[str, str]] = None) -> Dict:
-    """Standard pre-built questions for email triage."""
-    categories = categories or {
-        "billing": "invoices, payments, refunds",
-        "technical": "bugs, outages, integrations",
-        "sales": "pricing, demos, new purchases",
-        "security": "phishing, scams, account compromise",
-        "hr": "hiring, leave, payroll",
-        "other": "none of the above",
-    }
-    return {
-        "category": {
-            "type": "choice",
-            "instructions": "Which team should handle the email in `body`?",
-            "criteria": categories,
-        },
-        "is_spam": {
-            "type": "noul",
-            "instructions": "Is this email unsolicited spam or bulk marketing?",
-        },
-        "is_phishing": {
-            "type": "noul",
-            "instructions": "Is this email a phishing or scam attempt to steal money, credentials, or personal data?",
-            "criteria": {"true": "phishing, scam, or fraud", "false": "a legitimate email"},
-        },
-        "urgency": {
-            "type": "score",
-            "instructions": "How urgent is the request in `body`?",
-            "criteria": ["no time pressure", "needs attention soon", "blocking issue or hard deadline"],
-        },
-        "needs_reply": {
-            "type": "noul",
-            "instructions": "Does the sender expect a reply?",
-        },
-    }

@@ -9,7 +9,19 @@ Every checkpoint answered **byte-identical questions** in each run (fixed seed).
 | Applications | the seven workflow themes + the datasets where Jev numbers exist, all three checkpoints (laya 0.2.1, CPU, 400 cases per task, seed 13, 2026-09-19) | `research/results/app_benchmark_results.json` |
 
 
-**Calibration columns in the CPU sweep predate the temperature clamp.** The 51-language ECE and mean-confidence figures were produced before #42 clamped temperatures to `[0.5, 5]`, so today's package reports different confidence for the affected buckets (`choice:11+` is now served at 0.5, not 0.1006). Accuracy columns are unaffected. A re-run with the current package is tracked in #208.
+**Calibration columns in the CPU sweep predate the temperature clamp.** The 51-language ECE and mean-confidence figures were produced before #42 clamped temperatures to `[0.5, 5]`, so today's package reports different confidence for the affected buckets. Accuracy columns are unaffected, because a temperature-scaled softmax has the same argmax at every positive temperature.
+
+The same 51 languages and 5,100 cases have now been re-run after the temperature clamp, in both regimes (`research/results/cpu_51_language_sweep_clamped.json`, [#208](https://github.com/NandhaKishorM/laya/issues/208)). Macro accuracy reproduces at **0.2269** exactly, and macro ECE moves **0.7331 → 0.5709**:
+
+| | committed | re-run, raw temperatures | re-run, as served |
+|---|---|---|---|
+| macro accuracy | 0.2269 | 0.2269 | 0.2269 |
+| macro ECE | 0.7331 | **0.7331** | 0.5709 |
+| macro F1 | 0.2053 | 0.2053 | 0.2053 |
+| mean confidence, `en` | 0.9989 | **0.9989** | 0.9582 |
+| ECE, `en` | 0.1789 | **0.1789** | 0.1382 |
+
+The raw-temperature column reproduces the committed file, so the only variable left is the clamp. `choice:11+` is the sole bucket it moves, and every case in this sweep is a 20-option question, so the clamp applies to all 5,100 — and lowers ECE in all 51 languages. `acc_at_50_coverage` is the one rank-quality column that uses the confidence values: macro 0.3004 → 0.3020, and `en` 0.94 → 0.98, so the flatter distribution selects a slightly better half rather than a worse one.
 
 ---
 
@@ -144,7 +156,7 @@ banking77 is the one clear loss, and it is architectural: a choice question's op
 |---|---|---|---|---|---|
 | `laya-typed-decisions` | **0.766** | 0.471 | 0.061 | 0.213 | 0.242 |
 | `laya` | 0.361 | 0.332 | 0.316 | 0.175 | 0.694 |
-| `laya-multilingual` | 0.342 | 0.326 | 0.439 | 0.285 | 0.687 |
+| `laya-multilingual` | 0.352 | 0.328 | 0.463 | 0.314 | 0.760 |
 | *Jev 1.13.0 (published)* | *0.727* | *0.580* | *0.148* | *0.144* | *0.391* |
 | *teacher ceiling* | *0.735* | *—* | *—* | *—* | *—* |
 | *majority class* | *0.461* | *—* | *—* | *—* | *—* |
@@ -157,7 +169,7 @@ banking77 is the one clear loss, and it is architectural: a choice question's op
 | invoice processing | 0.804 |
 | security incidents | 0.766 |
 
-**The base checkpoints sit below the majority-class baseline** (0.362 and 0.342 against 0.461). All of the capability on this benchmark comes from fine-tuning.
+**The base checkpoints sit below the majority-class baseline** (0.362 and 0.352 against 0.461). All of the capability on this benchmark comes from fine-tuning.
 
 ---
 
@@ -194,7 +206,7 @@ How often the answer changes when the options are permuted. Jev measured at 0.13
 At 20 options both are less order-stable than Jev — worth fixing with more aggressive option-order shuffling during training.
 
 
-## Other hardware: GB10 and a laptop CPU
+## Other hardware: GB10, a laptop CPU, and an Intel Arc
 
 Contributed measurements from a router deployment (laya 0.3.5). They were taken through a small HTTP server wrapping `Agent.system_one`, not in-process, so every figure includes one HTTP round trip.
 
@@ -230,9 +242,33 @@ With inter-op pinned, one question in-process on a quieter host:
 
 The best setting is the physical core count plus a little, not one thread per vCPU. SMT siblings contend.
 
+### Intel Arc B390 (torch 2.14.0+xpu), XPU — before/after vs CPU
+
+`english` checkpoint (421M, ModernBERT-large), in-process `agent.predict()`, one 2-option `choice` question (~90 tokens), 40 calls per row after 5 warm-ups. XPU row at the default bf16 with autocast (XPU autocast supports bf16/fp16 only); CPU row fp32, pinned as recommended above (intra-op 8, inter-op 1). Rows measured on the same laptop; CPU rows are stable across sessions (p95 within ~10% of p50).
+
+| questions per call | CPU p50 | XPU p50 | XPU p95 | speedup (p50) |
+|---|---|---|---|---|
+| 1 | 288.2 ms | **29.7 ms** | 30.4 ms | 9.7x |
+| 3 | 730.6 ms | **45.4 ms** | 46.8 ms | 16.1x |
+| 10 | 2608.7 ms | **96.9 ms** | 102.5 ms | 26.9x |
+
+CPU scales roughly linearly with question count (288.2 -> 2608.7 ms, 9.1x for 10x the questions), while XPU scales sub-linearly (29.7 -> 96.9 ms, 3.3x), so the speedup widens from ~10x to ~27x. The XPU p95 stays within ~6% of its p50 on every row (30.4, 46.8, 102.5). At one question the Arc B390 is slightly faster than the T4's 32.8 ms p50 above.
+
 ### Calibration on a routing task runs the other way
 
 On laya_router's 180 requests (zero-shot, one 3-tier `choice`), nearly every configuration we measured was **under**-confident (the few exceptions were +0.01 to +0.06, and among the least accurate). Mean P(chosen) (the chosen option's probability, not the entropy-based `confidence` field) sat below accuracy, by −0.18 on the root checkpoint with example-led tier descriptions (0.562 vs 0.744) and by −0.19 on `typed-decisions` (0.501 vs 0.694). This is one task and one set of labels, so it does not contradict the over-confidence reported above. It does mean the direction of the miscalibration depends on the task, and a temperature fit on your own data is the right fix either way.
+
+## Server CPU: AMD EPYC 9R14, 4 cores, Linux
+
+`research/scripts/bench_latency.py` ran in-process and unchanged at v0.3.20 on an AWS `m7a.xlarge`: 4 physical cores (no SMT), 16 GiB RAM. The run used `OMP_NUM_THREADS=4`, `device="cpu"`, fp32, torch 2.14.0, transformers 5.17.0, Python 3.14.4, and checkpoints at revision `55cf4c4`. Questions alternate a 3-option `choice` and a `noul`. Each row is 10 timed calls after 2 warm-up calls. Raw results: `research/results/latency_cpu_m7a_xlarge_20260924.json`.
+
+| checkpoint | 1 question | 5 | 10 | 50 | cold load |
+|---|---|---|---|---|---|
+| english | 580 ms | 3,072 ms | 6,244 ms | 35,969 ms | 4.4 s |
+| multilingual | 193 ms | 912 ms | 1,842 ms | 11,157 ms | 2.5 s |
+| typed-decisions | 584 ms | 2,819 ms | 6,031 ms | 35,653 ms | 0.5 s |
+
+Values are p50. p95 is within 2% of p50 on every row. Up to 10 questions, each question costs about 600 ms on `english` and `typed-decisions` and about 185 ms on `multilingual`. At 50 questions, the cost per question rises by 15–20% on all three. Batching questions saves little on CPU, unlike the GB10 above. Cold load depends on the OS file cache, so treat that column as approximate. Peak memory for the whole script, with up to five checkpoints loaded at once, was 9.3 GiB (maximum RSS).
 
 ---
 
@@ -244,3 +280,129 @@ On laya_router's 180 requests (zero-shot, one 3-tier `choice`), nearly every con
 - **Both checkpoints ship over-confident.** Fit temperatures on your own data.
 - **Ordinal `score` is the weakest primitive** (SST-5 0.372).
 - `laya` collapses outside English; `laya-multilingual` is weaker on English. Route.
+
+---
+
+## GPU fast path
+
+`pip install laya[fast]` + `laya.load(..., fast=True)` replaces the encoder/head forward with fused
+[TileLang](https://github.com/tile-ai/tilelang) kernels (GEMM+epilogue, GEMM+GEGLU, residual+LayerNorm,
+in-place RoPE, sliding-window flash attention over the packed QKV buffer), bf16-resident weights and one
+CUDA graph per (batch, length) bucket. Measured with `benchmarks/bench_fast.py --eval 1000` on an
+RTX 4070 Ti SUPER, torch 2.11 + CUDA 13, tilelang 0.1.14; raw numbers in `benchmarks/results/`.
+
+### Same answers
+
+`benchmarks/parity_fast.py` answers a fixed, deterministic set of 60 states x up to 8 questions (the five presets over
+12 texts in six languages, short and long) with the stock bf16-autocast forward, the fast path, and an fp32 forward as
+the reference; every per-option probability from all three is in `benchmarks/results/parity_*.json`, so the comparison
+can be re-checked without a GPU.
+
+| checkpoint | type | n | max \|p_fast - p_stock\| | max \|p_fast - p_fp32\| | max \|p_stock - p_fp32\| | argmax fast = stock | fast = fp32 |
+|---|---|---|---|---|---|---|---|
+| laya | choice | 48 | 0.031 | **0.022** | 0.024 | 47/48 | 47/48 |
+| laya | noul | 180 | 0.076 | **0.043** | 0.058 | 180/180 | 180/180 |
+| laya | score | 60 | 0.015 | **0.011** | 0.017 | 59/60 | 60/60 |
+| laya-multilingual | choice | 48 | 0.049 | **0.015** | 0.039 | 47/48 | 47/48 |
+| laya-multilingual | noul | 180 | 0.037 | 0.045 | 0.045 | 180/180 | 179/180 |
+| laya-multilingual | score | 60 | 0.010 | **0.009** | 0.009 | 59/60 | 59/60 |
+
+The fast path stays close to the fp32 reference on every row — at most **0.046** away, against 0.058 for the stock
+path on the same row — and no row is more than **0.076** from stock. The residual stream stays in fp32 in both, and
+the two bf16 paths differ from each other only by bf16 accumulation order; the few argmax disagreements are near-tie
+options, and on every one of them the fast path agrees with fp32. One row is the exception to the stronger reading
+that used to be printed here: on `laya-multilingual` `noul` the stock bf16 path is marginally closer to fp32 than the
+fast path is (0.0446 against 0.0455), so this table does not show that the fast path is never further from fp32.
+Dataset accuracy / ECE (AG News, dair-ai emotion, 1,000 samples each) are identical within noise; see
+`benchmarks/bench_fast.py --eval 1000`.
+
+### fp16
+
+The fast path runs in the agent's autocast dtype when `accelerate()` is called, so an agent set to fp16
+(`agent.dtype = torch.float16`, or the CUDA autocast override proposed for #443) gets fp16 kernels and fp16
+weights; the residual stream and every accumulation stay fp32 in both dtypes. Same fixed set,
+`parity_fast.py --dtype fp16 | bf16`, RTX 4070 Ti SUPER; per-option probabilities in
+`benchmarks/results/parity_*_rtx4070.json` (the bf16 columns are the table above, plus a bf16 run of
+`laya-typed-decisions`):
+
+| checkpoint | type | n | max \|p_fast - p_fp32\| bf16 | max \|p_fast - p_fp32\| fp16 | argmax fast = fp32, bf16 | fp16 |
+|---|---|---|---|---|---|---|
+| laya | choice | 48 | 0.022 | **0.004** | 47/48 | 48/48 |
+| laya | noul | 180 | 0.043 | **0.005** | 180/180 | 180/180 |
+| laya | score | 60 | 0.011 | **0.003** | 60/60 | 60/60 |
+| laya-multilingual | choice | 48 | 0.015 | **0.002** | 47/48 | 48/48 |
+| laya-multilingual | noul | 180 | 0.045 | **0.009** | 179/180 | 180/180 |
+| laya-multilingual | score | 60 | 0.009 | **0.001** | 59/60 | 60/60 |
+| laya-typed-decisions | choice | 48 | 0.019 | **0.002** | 47/48 | 47/48 |
+| laya-typed-decisions | noul | 180 | 0.023 | **0.005** | 180/180 | 180/180 |
+| laya-typed-decisions | score | 60 | 0.009 | **0.001** | 60/60 | 60/60 |
+
+In fp16 the fast path is 3-10x closer to fp32 than in bf16 and agrees with the fp16 stock path on every argmax
+(864/864; the most it moves a probability against fp16 stock is 0.009). The one fp16 disagreement with fp32 is a
+`laya-typed-decisions` choice question whose top two options are 0.001 apart in fp32; the fp16 stock path flips it too.
+`agent.predict()` latency shows no consistent difference between the dtypes: on every case of the table below, on
+both checkpoints, fp16 and bf16 are within 10% of each other in both directions (single runs of 50 iterations), for
+stock and fast alike.
+
+### Latency, `agent.predict()` end to end (ms, incl. tokenization)
+
+| checkpoint | case | stock | fast | speedup |
+|---|---|---|---|---|
+| laya (ModernBERT-large) | 1 question, 72 tok | 17.7 | 4.6 | **3.8×** |
+| | 3 questions, 72 tok | 18.9 | 6.6 | 2.9× |
+| | 30 questions, 72 tok | 43.2 | 35.7 | 1.2× |
+| | 30 questions, 512 tok | 327.5 | 232.1 | 1.4× |
+| laya-multilingual (mmBERT-base) | 1 question, 72 tok | 14.1 | 2.8 | **5.1×** |
+| | 3 questions, 72 tok | 15.0 | 3.9 | 3.9× |
+| | 30 questions, 72 tok | 22.2 | 17.8 | 1.2× |
+| | 30 questions, 966 tok | 320.7 | 187.6 | 1.7× |
+| laya-multilingual, AG News eval loop | 1 question / sample | 14.9 | 3.2 | 4.7× |
+
+Small requests are launch-overhead bound in the stock path (≈200 kernels from Python per call); the CUDA
+graph removes that. Large batches are GEMM bound; the fused kernels sit at ~80 TFLOPS there, on par with
+cuBLAS, so the gain comes from the fused epilogues and the sliding-window attention (16× faster than SDPA
+with a dense mask at L=1024). First use of a new length bucket compiles kernels (a few seconds, cached on
+disk); inputs ≤256 tokens share one dynamic-shape kernel and never recompile.
+
+## Community evaluation: zh-CN / zh-TW (external, 2026-09-25)
+
+From [@CodyQin](https://github.com/CodyQin)'s [zh-decision-bench](https://github.com/CodyQin/zh-decision-bench) (dataset CC BY 4.0, raw predictions published). Three parts:
+
+### 1. Same-methodology rerun of Part A (zh only, current package)
+
+`bench_local.py` Part A rerun on laya **0.3.20** (CUDA), public checkpoints, `--per-lang 100`, seed 13 — result file: `research/results/zh_rerun_part_a.json`. The english checkpoint's accuracies replicate the sweep above **exactly**; multilingual zh-TW improves under 0.3.20 + the temperature clamp.
+
+| checkpoint | zh-CN acc / ECE | zh-TW acc / ECE | vs sweep above (0.2.0, pre-clamp) |
+|---|---|---|---|
+| english | 0.620 / 0.320 | 0.460 / 0.434 | accuracy identical (0.62 / 0.46); ECE lower post-clamp |
+| multilingual | 0.650 / 0.219 | 0.610 / 0.266 | zh-CN within noise; zh-TW 0.54 -> 0.61 |
+
+### 2. zh-decision-bench: business-scenario eval set (laya-evals format)
+
+219 items / 284 questions: MASSIVE zh-CN dev (quality-filtered, 6-domain routing) plus human-adjudicated synthetic e-commerce CS and content-moderation items. Ships in this harness's format as `research/evals/zh_decision_bench.jsonl`:
+
+```bash
+laya-evals run research/evals/zh_decision_bench.jsonl --model multilingual --slice tag
+```
+
+Results (laya 0.3.20, CUDA; bootstrap CIs and raw predictions in the source repo):
+
+| checkpoint | voice routing (n=179) | CS routing (n=25) | urgency (n=25) | scam/promo (n=15) | escalate (n=40) |
+|---|---|---|---|---|---|
+| multilingual | 0.883 / 0.061 | 0.640 / 0.293 | 0.560 / 0.091 | 0.667 / 0.311 | 0.550 / 0.230 |
+| english | 0.754 / 0.281 | 0.520 / 0.184 | 0.520 / 0.207 | 0.667 / 0.321 | 0.575 / 0.269 |
+
+Also measured: option-order flip rate 28% (CS) / 10.6% (voice); zh-CN to native zh-TW parallel-utterance flip rate 12.8%. Task framing differs from the sweep above (6-domain routing vs 20-way intent), so these complement rather than compare.
+
+### 3. Temperature refit for zh (official `temp_bucket` convention)
+
+Refit on zh-decision-bench (multilingual checkpoint; 50/50 fit/test split by item hash), clamped to `[0.5, 5]`:
+
+| bucket | T raw | T clamped | test ECE before -> after |
+|---|---|---|---|
+| choice:6-10 | 1.52 | 1.52 | 0.062 -> 0.093 |
+| choice:3-5 | 2.61 | 2.61 | 0.329 -> 0.352 |
+| score:3-5 | 1.33 | 1.33 | 0.118 -> 0.126 |
+| noul:2 | 10.23 | 5.00 | 0.180 -> 0.098 |
+
+The `noul:2` raw fit (10.2) exceeds `TEMP_MAX`: Chinese binary-judgment over-confidence outruns the shipped clamp's correction range (NLL still improves, 0.79 -> 0.55).

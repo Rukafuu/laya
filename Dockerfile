@@ -1,4 +1,7 @@
-FROM python:3.11-slim-bookworm AS build
+# Build and runtime share one base so the copied virtualenv matches its interpreter.
+ARG PYTHON_IMAGE=python:3.11-slim-bookworm
+
+FROM ${PYTHON_IMAGE} AS build
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -6,22 +9,36 @@ ENV PIP_NO_CACHE_DIR=1 \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# CPU by default; the CUDA Compose override selects cu128.
+# CPU by default on AMD64 and ARM64. The CUDA override selects cu128 and the
+# DGX Spark override selects cu130. Bump TORCH_VERSION deliberately; the check
+# below fails the build if the wheel does not match the requested index.
 ARG TORCH_INDEX=cpu
-RUN pip install torch --index-url https://download.pytorch.org/whl/${TORCH_INDEX}
+ARG TORCH_VERSION=2.14.0
+COPY docker/check_torch.py /opt/check_torch.py
+RUN pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/${TORCH_INDEX} \
+    && python /opt/check_torch.py "${TORCH_INDEX}" \
+    && pip check
 
 WORKDIR /src
 COPY pyproject.toml setup.py README.md LICENSE ./
 COPY laya/ ./laya/
-RUN pip install . && pip check
+# The `serve` extra puts `laya-serve` (POST /v1/systemone, GET /health) in the image, so
+# the same image can run a one-shot request or serve the Jev-compatible API. It adds
+# fastapi and uvicorn only; torch was installed above.
+RUN pip install ".[serve]" && pip check
 
-FROM python:3.11-slim-bookworm AS runtime
+FROM ${PYTHON_IMAGE} AS runtime
 
 LABEL org.opencontainers.image.title="Laya Docker quickstart" \
       org.opencontainers.image.source="https://github.com/NandhaKishorM/laya" \
       org.opencontainers.image.licenses="Apache-2.0"
 
+# torch 2.14 swaps some eager CUDA ops (bmm, topk, sum, norms) for Triton kernels that it
+# compiles on the first inference, which needs a C compiler this image does not carry: the
+# container reports healthy, then every request fails (#365). The stock kernels give the same
+# answers at the same latency.
 ENV PATH="/opt/venv/bin:$PATH" \
+    TORCH_DISABLE_NATIVE_JIT=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     USE_TF=0 \
